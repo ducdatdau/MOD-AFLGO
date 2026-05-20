@@ -122,6 +122,12 @@ enum {
   /* 01 */ SAN_LOG,                   /* Logarithmical schedule                */
   /* 02 */ SAN_LIN,                   /* Linear schedule                       */
   /* 03 */ SAN_QUAD                   /* Quadratic schedule                    */
+#ifdef MOD_AFLGO_FAST
+          ,SAN_FAST                   /* Fast schedule                         */
+#endif // MOD_AFLGO_FAST
+#ifdef MOD_AFLGO_GEXP
+          ,SAN_GEXP                   /* Generalized exponential schedule      */
+#endif // MOD_AFLGO_GEXP
 };
 
 #endif // AFLGO_IMPL
@@ -4848,6 +4854,58 @@ static u32 choose_block_len(u32 limit) {
 
 }
 
+#if AFLGO_IMPL && defined(MOD_AFLGO_FAST)
+
+static double fast_aflgo_temperature(double x) {
+
+  double y, c, denom, T;
+
+  if (x >= 1.0) return 0.0;
+  if (x <= 0.0) return 1.0;
+
+  y = x - 1.0;
+  c = cos(y);
+  denom = exp(-0.001 * y) * c * c;
+
+  if (denom <= 0.0) return 0.0;
+
+  T = (1.0 / denom) - 1.0;
+
+  if (T < 0.0) T = 0.0;
+  if (T > 1.0) T = 1.0;
+
+  return T;
+}
+
+#endif // AFLGO_IMPL && defined(MOD_AFLGO_FAST)
+
+#if AFLGO_IMPL && defined(MOD_AFLGO_GEXP)
+// T(x) = 20 ^ -((x / λ)^γ)
+
+// x  = elapsed_time / time_to_exploitation
+// λ  = thời điểm muốn đạt T = 0.05
+// γ  = độ cong của quá trình cooling
+static double mod_gexp_temperature(double x) {
+
+  const double lambda = 0.80;
+  const double gamma  = 1.00;
+
+  double z, T;
+
+  if (x <= 0.0) return 1.0;
+
+  if (x >= lambda) return 0.05;
+
+  z = x / lambda;
+
+  T = pow(20.0, -pow(z, gamma));
+
+  if (T < 0.05) T = 0.05;
+  if (T > 1.0)  T = 1.0;
+
+  return T;
+}
+#endif // AFLGO_IMPL && defined(MOD_AFLGO_GEXP)
 
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
@@ -4945,6 +5003,18 @@ static u32 calculate_score(struct queue_entry* q) {
       T = 1.0 / (1.0 + 19.0 * pow(progress_to_tx, 2));
 
       break;
+
+#ifdef MOD_AFLGO_FAST
+    case SAN_FAST:
+      T = fast_aflgo_temperature(progress_to_tx);
+      break;
+#endif // MOD_AFLGO_FAST
+
+#ifdef MOD_AFLGO_GEXP
+    case SAN_GEXP:
+      T = mod_gexp_temperature(progress_to_tx);
+      break;
+#endif
 
     default:
       PFATAL ("Unkown Power Schedule for Directed Fuzzing");
@@ -8186,6 +8256,13 @@ int main(int argc, char** argv) {
           cooling_schedule = SAN_LIN;
         else if (!stricmp(optarg, "quad"))
           cooling_schedule = SAN_QUAD;
+#ifdef MOD_AFLGO_FAST
+        else if (!stricmp(optarg, "fast")) cooling_schedule = SAN_FAST;
+#endif // MOD_AFLGO_FAST
+
+#ifdef MOD_AFLGO_GEXP
+        else if (!stricmp(optarg, "gexp")) cooling_schedule = SAN_GEXP;
+#endif // MOD_AFLGO_GEXP  
         else
           PFATAL ("Unknown value for option -z");
 

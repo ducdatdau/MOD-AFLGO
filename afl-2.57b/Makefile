@@ -32,6 +32,10 @@ CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
 	      -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
 	      -DBIN_PATH=\"$(BIN_PATH)\" \
 	      -DAFLGO_IMPL=1
+# Turn on FastAFLGo mode: 
+# CFLAGS     += -DMOD_AFLGO_FAST=1
+# Turn on Generalized ExponentialAFLGo mode: 
+# CFLAGS     += -DMOD_AFLGO_GEXP=1
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
   LDFLAGS  += -ldl -lm
