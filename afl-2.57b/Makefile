@@ -36,6 +36,8 @@ CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
 # CFLAGS     += -DMOD_AFLGO_FAST=1
 # Turn on Generalized ExponentialAFLGo mode: 
 # CFLAGS     += -DMOD_AFLGO_GEXP=1
+# Turn on logging of MOD-AFLGo metrics:
+# CFLAGS     += -DMOD_AFLGO_LOG=1	
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
   LDFLAGS  += -ldl -lm

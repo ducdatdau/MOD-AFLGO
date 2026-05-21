@@ -71,6 +71,10 @@
 #  include <math.h>
 #endif // AFLGO_IMPL
 
+#if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+static FILE* mod_metric_file = NULL;
+#endif // AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
@@ -5038,6 +5042,24 @@ static u32 calculate_score(struct queue_entry* q) {
 
   perf_score *= power_factor;
 
+#if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+  if (mod_metric_file && (total_execs % 10000 == 0)) {
+    fprintf(mod_metric_file,
+      "%llu,%llu,%u,%f,%f,%f,%f,%f,%f,%u\n",
+      t,
+      total_execs,
+      current_entry,
+      q->distance,
+      min_distance,
+      max_distance,
+      T,
+      p,
+      power_factor,
+      perf_score);
+    fflush(mod_metric_file);
+  }
+#endif // AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+
 #endif // AFLGO_IMPL
 
   /* Make sure that we don't go over limit. */
@@ -8372,6 +8394,20 @@ int main(int argc, char** argv) {
   init_count_class16();
 
   setup_dirs_fds();
+#if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+  {
+    u8* fn = alloc_printf("%s/mod_metrics.csv", out_dir);
+
+    mod_metric_file = fopen(fn, "w");
+    if (!mod_metric_file) PFATAL("Unable to create MOD-AFLGo metric log file");
+
+    fprintf(mod_metric_file,
+      "time_sec,total_execs,current_entry,current_distance,min_distance,max_distance,T,p,power_factor,perf_score\n");
+
+    fflush(mod_metric_file);
+    ck_free(fn);
+  }
+#endif // AFLGO_IMPL && defined(MOD_AFLGO_LOG)
   read_testcases();
   load_auto();
 
