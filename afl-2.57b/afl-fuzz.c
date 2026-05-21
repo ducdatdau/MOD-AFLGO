@@ -73,6 +73,7 @@
 
 #if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
 static FILE* mod_metric_file = NULL;
+static u64 last_metric_execs = 0;
 #endif // AFLGO_IMPL && defined(MOD_AFLGO_LOG)
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
@@ -5044,7 +5045,8 @@ static u32 calculate_score(struct queue_entry* q) {
   perf_score *= power_factor;
 
 #if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
-  if (mod_metric_file && (total_execs % 10000 == 0)) {
+  if (mod_metric_file && (total_execs >= last_metric_execs + 10000)) {
+    last_metric_execs = total_execs;
     fprintf(mod_metric_file,
       "%llu,%llu,%u,%f,%f,%f,%f,%f,%f,%u\n",
       t,
@@ -8083,6 +8085,10 @@ int main(int argc, char** argv) {
 
   struct timeval tv;
   struct timezone tz;
+
+#if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+OKF("MOD_AFLGO_LOG enabled, writing metrics to mod_metrics.csv");
+#endif
 
 #if AFLGO_IMPL
   SAYF(cCYA "aflgo (yeah!) " cBRI VERSION cRST "\n");
