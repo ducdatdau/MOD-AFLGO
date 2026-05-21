@@ -5025,6 +5025,7 @@ static u32 calculate_score(struct queue_entry* q) {
   }
 
   double power_factor = 1.0;
+  double p = 0.0;
   if (q->distance > 0) {
 
     double normalized_d = 0; // when "max_distance == min_distance", we set the normalized_d to 0 so that we can sufficiently explore those testcases whose distance >= 0.
@@ -5033,7 +5034,7 @@ static u32 calculate_score(struct queue_entry* q) {
 
     if (normalized_d >= 0) {
 
-        double p = (1.0 - normalized_d) * (1.0 - T) + 0.5 * T;
+        p = (1.0 - normalized_d) * (1.0 - T) + 0.5 * T;
         power_factor = pow(2.0, 2.0 * (double) log2(MAX_FACTOR) * (p - 0.5));
 
     }// else WARNF ("Normalized distance negative: %f", normalized_d);
