@@ -71,10 +71,10 @@
 #  include <math.h>
 #endif // AFLGO_IMPL
 
-#if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+#if MOD_AFLGO_LOG
 static FILE* mod_metric_file = NULL;
 static u64 last_metric_execs = 0;
-#endif // AFLGO_IMPL && defined(MOD_AFLGO_LOG)
+#endif // MOD_AFLGO_LOG
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -130,6 +130,7 @@ enum {
 #ifdef MOD_AFLGO_FAST
           ,SAN_FAST                   /* Fast schedule                         */
 #endif // MOD_AFLGO_FAST
+
 #ifdef MOD_AFLGO_GEXP
           ,SAN_GEXP                   /* Generalized exponential schedule      */
 #endif // MOD_AFLGO_GEXP
@@ -291,6 +292,7 @@ struct queue_entry {
   double distance;                    /* Distance to targets              */
 #endif // AFLGO_IMPL
 
+
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
 
@@ -303,6 +305,7 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
+
 
 struct extra_data {
   u8* data;                           /* Dictionary token data            */
@@ -8086,8 +8089,17 @@ int main(int argc, char** argv) {
   struct timeval tv;
   struct timezone tz;
 
-#if AFLGO_IMPL && defined(MOD_AFLGO_LOG)
-OKF("MOD_AFLGO_LOG enabled, writing metrics to mod_metrics.csv");
+#if AFLGO_IMPL
+OKF("AFLGO_IMPL: ON");
+#endif
+#if MOD_AFLGO_LOG
+OKF("MOD_AFLGO_LOG: ON");
+#endif
+#if MOD_AFLGO_FAST
+OKF("MOD_AFLGO_FAST: ON");
+#endif
+#if MOD_AFLGO_GEXP
+OKF("MOD_AFLGO_GEXP: ON");
 #endif
 
 #if AFLGO_IMPL

@@ -1,6 +1,7 @@
 #!/bin/bash
 
 SAVE_DIR="$HOME/MOD-AFLGO/analyze/results"
+mkdir "$SAVE_DIR"
 
 while true; do
     TIME_STAMP=$(date +"%Y-%m-%d_%H-%M-%S")
