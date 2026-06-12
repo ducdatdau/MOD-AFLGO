@@ -76,6 +76,72 @@ static FILE* mod_metric_file = NULL;
 static u64 last_metric_execs = 0;
 #endif // MOD_AFLGO_LOG
 
+/* ================================================================
+   TinyFuzz: Dynamic Rank-based Three-Queue Priority Scheduling
+   ----------------------------------------------------------------
+   Enable with:
+       -DMOD_AFLGO_TINY_QUEUE
+
+   This feature does NOT replace AFL/AFLGo's original queue.
+   It adds three auxiliary queues as a scheduling layer:
+
+       Q1: high-priority seeds
+       Q2: medium-priority seeds
+       Q3: low-priority / reserve seeds
+
+   The original AFLGo queue is still used to store all seeds.
+   Q1/Q2/Q3 only store pointers to queue_entry objects.
+   ================================================================ */
+
+   #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+   /* Three auxiliary queue levels. */
+   #define TINY_Q_NONE  0
+   #define TINY_Q_HIGH  1
+   #define TINY_Q_MID   2
+   #define TINY_Q_LOW   3
+   
+   /* Selection ratio among Q1, Q2, Q3.
+      In every 10 selections:
+        - 7 times prefer Q1
+        - 2 times prefer Q2
+        - 1 time prefer Q3
+   
+      This keeps directed exploitation strong, but still preserves exploration. */
+   #define TINY_Q1_RATIO 7
+   #define TINY_Q2_RATIO 2
+   #define TINY_Q3_RATIO 1
+   #define TINY_Q_TOTAL_RATIO (TINY_Q1_RATIO + TINY_Q2_RATIO + TINY_Q3_RATIO)
+   
+   /* Rank boundaries.
+      These are percentile boundaries, NOT fixed distance thresholds.
+   
+      rank >= 0.80  -> top 20% seeds     -> Q1
+      rank >= 0.20  -> middle 60% seeds  -> Q2
+      rank <  0.20  -> bottom 20% seeds  -> Q3 */
+   #define TINY_RANK_HIGH 0.80
+   #define TINY_RANK_MID  0.20
+   
+   /* Weights for priority score:
+      Priority(s) =
+          wD * D(s) + wI * I(s) + wN * N(s) + wA * A(s) - wP * P(s)
+   
+      D(s): distance score, closer to target is better.
+      I(s): improvement score, child closer than parent is better.
+      N(s): novelty score, new coverage is better.
+      A(s): aging score, long-waiting seeds get rescued.
+      P(s): penalty score, repeatedly fuzzed seeds are slightly penalized. */
+   #define TINY_W_DIST    0.45
+   #define TINY_W_IMP     0.25
+   #define TINY_W_NOVEL   0.15
+   #define TINY_W_AGE     0.10
+   #define TINY_W_PENALTY 0.05
+   
+   /* Small epsilon to avoid division by zero. */
+   #define TINY_EPS 1e-9
+   
+   #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
@@ -292,6 +358,30 @@ struct queue_entry {
   double distance;                    /* Distance to targets              */
 #endif // AFLGO_IMPL
 
+#if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+  /* TinyFuzz metadata.
+     These fields are used only for the auxiliary priority queues.
+     They do not change the original AFLGo queue structure. */
+
+  double parent_distance;             /* Distance of the parent seed       */
+  double improve_score;               /* I(s): improvement over parent     */
+  double tiny_priority;               /* Priority(s): combined score       */
+  double tiny_rank;                   /* Rank(s): relative rank in corpus  */
+
+  u32 tiny_id;                        /* Stable queue ID for UI/logging    */
+  u32 tiny_fuzz_count;                /* Number of times selected by Tiny  */
+
+  u64 tiny_last_fuzz_cycle;           /* Last queue_cycle when fuzzed      */
+
+  u8  tiny_queue_level;               /* Q1/Q2/Q3 level                    */
+  u8  tiny_in_aux_queue;              /* Whether seed is linked in Q1/Q2/Q3*/
+
+  struct queue_entry *tiny_prev,      /* Previous seed in auxiliary queue  */
+                     *tiny_next;      /* Next seed in auxiliary queue      */
+
+#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+
 
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
@@ -302,6 +392,29 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
                           *queue_top, /* Top of the list                  */
                           *q_prev100; /* Previous 100 marker              */
+
+                          #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+                          /* TinyFuzz auxiliary queues.
+                             These queues store pointers to existing queue_entry objects.
+                             They do NOT own seed memory and must NOT free queue entries. */
+                          
+                          static struct queue_entry *tiny_q1_head = NULL, *tiny_q1_tail = NULL;
+                          static struct queue_entry *tiny_q2_head = NULL, *tiny_q2_tail = NULL;
+                          static struct queue_entry *tiny_q3_head = NULL, *tiny_q3_tail = NULL;
+                          
+                          static u32 tiny_q1_cnt = 0;
+                          static u32 tiny_q2_cnt = 0;
+                          static u32 tiny_q3_cnt = 0;
+                          
+                          /* Counts how many times TinyFuzz has selected a seed.
+                             Used to enforce the Q1:Q2:Q3 = 7:2:1 ratio. */
+                          static u64 tiny_select_cnt = 0;
+
+                          static u32 tiny_cycle_budget = 0;
+                          static u32 tiny_cycle_done   = 0;
+                                                    
+                          #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
@@ -826,6 +939,374 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 }
 
+#if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+/* Return the head pointer of the selected TinyFuzz queue level. */
+static struct queue_entry** tiny_head_of(u8 level) {
+
+  switch (level) {
+    case TINY_Q_HIGH: return &tiny_q1_head;
+    case TINY_Q_MID:  return &tiny_q2_head;
+    case TINY_Q_LOW:  return &tiny_q3_head;
+    default:          return NULL;
+  }
+
+}
+
+/* Return the tail pointer of the selected TinyFuzz queue level. */
+static struct queue_entry** tiny_tail_of(u8 level) {
+
+  switch (level) {
+    case TINY_Q_HIGH: return &tiny_q1_tail;
+    case TINY_Q_MID:  return &tiny_q2_tail;
+    case TINY_Q_LOW:  return &tiny_q3_tail;
+    default:          return NULL;
+  }
+
+}
+
+/* Increase or decrease the counter of a TinyFuzz queue level. */
+static void tiny_update_count(u8 level, s32 delta) {
+
+  u32* cnt = NULL;
+
+  switch (level) {
+    case TINY_Q_HIGH: cnt = &tiny_q1_cnt; break;
+    case TINY_Q_MID:  cnt = &tiny_q2_cnt; break;
+    case TINY_Q_LOW:  cnt = &tiny_q3_cnt; break;
+    default: return;
+  }
+
+  if (delta > 0) (*cnt)++;
+  else if (*cnt > 0) (*cnt)--;
+
+}
+
+/* Remove a seed from its current auxiliary queue.
+   This does not remove the seed from AFLGo's original queue. */
+static void tiny_unlink_aux(struct queue_entry* q) {
+
+  struct queue_entry **head, **tail;
+
+  if (!q || !q->tiny_in_aux_queue) return;
+
+  head = tiny_head_of(q->tiny_queue_level);
+  tail = tiny_tail_of(q->tiny_queue_level);
+
+  if (!head || !tail) return;
+
+  if (q->tiny_prev) q->tiny_prev->tiny_next = q->tiny_next;
+  else *head = q->tiny_next;
+
+  if (q->tiny_next) q->tiny_next->tiny_prev = q->tiny_prev;
+  else *tail = q->tiny_prev;
+
+  tiny_update_count(q->tiny_queue_level, -1);
+
+  q->tiny_prev = NULL;
+  q->tiny_next = NULL;
+  q->tiny_queue_level = TINY_Q_NONE;
+  q->tiny_in_aux_queue = 0;
+
+}
+
+/* Append a seed to one of Q1/Q2/Q3.
+   The seed is not copied; only its pointer is linked. */
+static void tiny_append_aux(struct queue_entry* q, u8 level) {
+
+  struct queue_entry **head, **tail;
+
+  if (!q || level == TINY_Q_NONE) return;
+
+  /* Avoid duplicated links. */
+  if (q->tiny_in_aux_queue) tiny_unlink_aux(q);
+
+  head = tiny_head_of(level);
+  tail = tiny_tail_of(level);
+
+  if (!head || !tail) return;
+
+  q->tiny_prev = *tail;
+  q->tiny_next = NULL;
+
+  if (*tail) (*tail)->tiny_next = q;
+  else *head = q;
+
+  *tail = q;
+
+  q->tiny_queue_level = level;
+  q->tiny_in_aux_queue = 1;
+
+  tiny_update_count(level, +1);
+
+}
+
+/* Normalize AFLGo distance into [0, 1].
+   Smaller normalized distance means closer to target.
+
+   If distance information is not available, return 1.0, meaning
+   the seed is treated as far from target. */
+static double tiny_normalize_distance(double d) {
+
+  if (d <= 0 || max_distance <= 0 || min_distance <= 0)
+    return 1.0;
+
+  if (max_distance == min_distance)
+    return 0.5;
+
+  return (d - min_distance) / (max_distance - min_distance);
+
+}
+
+/* Compute TinyFuzz priority score for a seed.
+
+   Priority(s) =
+       w1 * D(s) + w2 * I(s) + w3 * N(s) + w4 * A(s) - w5 * P(s)
+
+   D(s): target distance score.
+   I(s): improvement over parent.
+   N(s): coverage novelty.
+   A(s): aging score.
+   P(s): fuzzing penalty. */
+static double tiny_calc_priority(struct queue_entry* q) {
+
+  double norm_d, D, I, N, A, P;
+  u64 waiting = 0;
+
+  if (!q) return 0.0;
+
+  /* D(s): seed closer to target gets higher score. */
+  norm_d = tiny_normalize_distance(q->distance);
+  D = 1.0 - norm_d;
+
+  if (D < 0.0) D = 0.0;
+  if (D > 1.0) D = 1.0;
+
+  /* I(s): improvement over parent seed.
+     If child distance is smaller than parent distance, it is promising. */
+  if (q->parent_distance > 0 && q->distance > 0) {
+    I = (q->parent_distance - q->distance) / (q->parent_distance + TINY_EPS);
+    if (I < 0.0) I = 0.0;
+    if (I > 1.0) I = 1.0;
+  } else {
+    I = 0.0;
+  }
+
+  q->improve_score = I;
+
+  /* N(s): coverage novelty.
+     AFL already marks has_new_cov when a seed discovers new tuples. */
+  N = q->has_new_cov ? 1.0 : 0.0;
+
+  /* A(s): aging.
+     A seed waiting for a long time gradually receives more priority.
+     The formula waiting / (1 + waiting) keeps the value in [0, 1). */
+  if (queue_cycle > q->tiny_last_fuzz_cycle)
+    waiting = queue_cycle - q->tiny_last_fuzz_cycle;
+
+  A = (double)waiting / (1.0 + (double)waiting);
+
+  /* P(s): penalty.
+     A seed selected many times is slightly penalized to avoid overusing it. */
+  P = (double)q->tiny_fuzz_count / (1.0 + (double)q->tiny_fuzz_count);
+
+  q->tiny_priority =
+      TINY_W_DIST    * D +
+      TINY_W_IMP     * I +
+      TINY_W_NOVEL   * N +
+      TINY_W_AGE     * A -
+      TINY_W_PENALTY * P;
+
+  return q->tiny_priority;
+
+}
+
+/* Compute relative rank of seed q among the whole AFLGo queue.
+
+   Important:
+     The set used here is the original AFLGo queue, not Q1/Q2/Q3.
+
+   Rank(s) =
+       number of seeds with Priority(x) <= Priority(s)
+       ------------------------------------------------
+                  total number of queued seeds
+
+   Rank close to 1.0 means seed is among the best seeds.
+   Rank close to 0.0 means seed is among the weakest seeds. */
+static double tiny_calc_rank(struct queue_entry* q) {
+
+  struct queue_entry* x = queue;
+  double p;
+  u32 le_cnt = 0, total = 0;
+
+  if (!q || !queue) return 0.5;
+
+  p = tiny_calc_priority(q);
+
+  while (x) {
+
+    double px = tiny_calc_priority(x);
+
+    if (px <= p) le_cnt++;
+    total++;
+
+    x = x->next;
+
+  }
+
+  if (!total) return 0.5;
+
+  q->tiny_rank = (double)le_cnt / (double)total;
+
+  return q->tiny_rank;
+
+}
+
+/* Classify a seed into Q1/Q2/Q3 according to its relative rank.
+
+   Top 20%    -> Q1
+   Middle 60% -> Q2
+   Bottom 20% -> Q3 */
+static void tiny_reclassify_seed(struct queue_entry* q) {
+
+  double r;
+
+  if (!q) return;
+
+  r = tiny_calc_rank(q);
+
+  if (r >= TINY_RANK_HIGH)
+    tiny_append_aux(q, TINY_Q_HIGH);
+  else if (r >= TINY_RANK_MID)
+    tiny_append_aux(q, TINY_Q_MID);
+  else
+    tiny_append_aux(q, TINY_Q_LOW);
+
+}
+
+/* Rebuild all three auxiliary queues.
+
+   This is useful at the beginning of a new queue cycle because priorities
+   can change over time due to aging and fuzz_count penalty. */
+static void tiny_rebuild_queues(void) {
+
+  struct queue_entry* q = queue;
+
+  tiny_q1_head = tiny_q1_tail = NULL;
+  tiny_q2_head = tiny_q2_tail = NULL;
+  tiny_q3_head = tiny_q3_tail = NULL;
+
+  tiny_q1_cnt = tiny_q2_cnt = tiny_q3_cnt = 0;
+
+  while (q) {
+
+    q->tiny_prev = NULL;
+    q->tiny_next = NULL;
+    q->tiny_in_aux_queue = 0;
+    q->tiny_queue_level = TINY_Q_NONE;
+
+    tiny_reclassify_seed(q);
+
+    q = q->next;
+
+  }
+
+}
+
+#if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+static void tiny_mark_selected(struct queue_entry* q) {
+
+  if (!q) return;
+
+  /* Remove this seed from auxiliary queues for the current cycle. */
+  tiny_unlink_aux(q);
+
+  /* Update metadata for aging and penalty. */
+  q->tiny_fuzz_count++;
+  q->tiny_last_fuzz_cycle = queue_cycle;
+
+}
+
+#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+
+/* Pick the best seed from one auxiliary queue.
+   "Best" means the highest current TinyFuzz priority score. */
+static struct queue_entry* tiny_pick_best(struct queue_entry* head) {
+
+  struct queue_entry* q = head;
+  struct queue_entry* best = NULL;
+  double best_p = -999999.0;
+
+  while (q) {
+
+    double p = tiny_calc_priority(q);
+
+    if (!best || p > best_p) {
+      best = q;
+      best_p = p;
+    }
+
+    q = q->tiny_next;
+
+  }
+
+  if (!best) return NULL;
+
+  tiny_mark_selected(best);
+  return best;
+
+}
+
+/* Select seed from a specific TinyFuzz queue level. */
+static struct queue_entry* tiny_select_from_level(u8 level) {
+
+  switch (level) {
+    case TINY_Q_HIGH: return tiny_pick_best(tiny_q1_head);
+    case TINY_Q_MID:  return tiny_pick_best(tiny_q2_head);
+    case TINY_Q_LOW:  return tiny_pick_best(tiny_q3_head);
+    default:          return NULL;
+  }
+
+}
+
+/* Main TinyFuzz seed selection function.
+
+   Selection policy:
+     Q1 : Q2 : Q3 = 7 : 2 : 1
+
+   If the selected queue is empty, fallback to other queues. */
+static struct queue_entry* tiny_select_seed(void) {
+
+  u32 r;
+  struct queue_entry* q = NULL;
+
+  if (!queue) return NULL;
+
+  /* If auxiliary queues are empty for some reason, rebuild them. */
+  if (!tiny_q1_cnt && !tiny_q2_cnt && !tiny_q3_cnt)
+    tiny_rebuild_queues();
+
+  r = tiny_select_cnt++ % TINY_Q_TOTAL_RATIO;
+
+  if (r < TINY_Q1_RATIO)
+    q = tiny_select_from_level(TINY_Q_HIGH);
+  else if (r < TINY_Q1_RATIO + TINY_Q2_RATIO)
+    q = tiny_select_from_level(TINY_Q_MID);
+  else
+    q = tiny_select_from_level(TINY_Q_LOW);
+
+  /* Fallback order: Q1 -> Q2 -> Q3 -> NULL. */
+  if (!q) q = tiny_select_from_level(TINY_Q_HIGH);
+  if (!q) q = tiny_select_from_level(TINY_Q_MID);
+  if (!q) q = tiny_select_from_level(TINY_Q_LOW);
+  if (!q) q = NULL;
+
+  return q;
+
+}
+
+#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
 /* Append new test case to the queue. */
 
@@ -837,6 +1318,29 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+  #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+  /* Stable ID of this seed in AFLGo's original queue.
+     queued_paths is not incremented yet here, so it is the new seed ID. */
+  q->tiny_id = queued_paths;
+
+  /* The current queue_cur is the parent seed that generated this new seed.
+     For initial seeds, queue_cur can be NULL. */
+  q->parent_distance = queue_cur ? queue_cur->distance : cur_distance;
+
+  q->improve_score = 0.0;
+  q->tiny_priority = 0.0;
+  q->tiny_rank = 0.5;
+
+  q->tiny_fuzz_count = 0;
+  q->tiny_last_fuzz_cycle = queue_cycle;
+
+  q->tiny_queue_level = TINY_Q_NONE;
+  q->tiny_in_aux_queue = 0;
+  q->tiny_prev = NULL;
+  q->tiny_next = NULL;
+
+#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
 #if AFLGO_IMPL
 
@@ -866,6 +1370,14 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   queued_paths++;
   pending_not_fuzzed++;
+  #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+  /* Insert the new seed into one of Q1/Q2/Q3.
+     For initial seeds, the distance may still be unknown at this moment.
+     It will be reclassified again after calibration. */
+  tiny_reclassify_seed(q);
+
+  #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
   cycles_wo_finds = 0;
 
@@ -2736,6 +3248,13 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
       }
 
     }
+    #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+    /* After calibration, initial seeds may finally get valid AFLGo distance.
+      Reclassify them so Q1/Q2/Q3 reflect the updated distance. */
+    tiny_reclassify_seed(q);
+
+  #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
 #endif // AFLGO_IMPL
 
@@ -3308,6 +3827,13 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     }
 
     queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+    #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+  /* The seed has just been marked with has_new_cov if it discovered new edges.
+     Reclassify it so coverage novelty N(s) is reflected in its priority. */
+  tiny_reclassify_seed(queue_top);
+
+#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
@@ -8481,13 +9007,58 @@ OKF("MOD_AFLGO_GEXP: ON");
       queue_cycle++;
       current_entry     = 0;
       cur_skipped_paths = 0;
-      queue_cur         = queue;
+      // queue_cur         = queue;
 
+      // while (seek_to) {
+      //   current_entry++;
+      //   seek_to--;
+      //   queue_cur = queue_cur->next;
+      // }
+      #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+      /* Start a new AFL-style queue cycle.
+     Snapshot the current corpus size. Even if new seeds are added
+     during this cycle, they will be counted in the next cycle. */
+      tiny_cycle_budget = queued_paths;
+      tiny_cycle_done   = 0;
+
+      /* At the beginning of each queue cycle, rebuild TinyFuzz auxiliary queues.
+        This refreshes ranks because aging and penalty may have changed. */
+      tiny_rebuild_queues();
+
+      if (seek_to) {
+
+        /* Keep AFL/AFLGo resume behavior unchanged. */
+        queue_cur = queue;
+    
+        while (seek_to) {
+          current_entry++;
+          seek_to--;
+          queue_cur = queue_cur->next;
+        }
+    
+        /* This seed is selected in the current TinyFuzz cycle,
+           so remove it from Q1/Q2/Q3 to avoid selecting it again
+           before the next cycle. */
+        tiny_mark_selected(queue_cur);
+    
+      } else {
+    
+        /* Select the first seed of this cycle using TinyFuzz scheduler. */
+        queue_cur = tiny_select_seed();
+    
+      }
+    
+    #else
+    
+      queue_cur = queue;
+    
       while (seek_to) {
         current_entry++;
         seek_to--;
         queue_cur = queue_cur->next;
       }
+
+      #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
       show_stats();
 
@@ -8525,8 +9096,38 @@ OKF("MOD_AFLGO_GEXP: ON");
 
     if (stop_soon) break;
 
-    queue_cur = queue_cur->next;
-    current_entry++;
+    // queue_cur = queue_cur->next;
+    // current_entry++;
+    #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+
+        /* One TinyFuzz scheduling step has finished. */
+        tiny_cycle_done++;
+        current_entry = tiny_cycle_done;
+
+        /* End this AFL-style queue cycle after selecting tiny_cycle_budget seeds.
+          This restores the original AFL behavior where a cycle ends after
+          traversing the whole corpus once. */
+        if (tiny_cycle_done >= tiny_cycle_budget) {
+
+          queue_cur = NULL;
+
+        } else {
+
+          /* Select next seed from Q1/Q2/Q3 instead of queue_cur->next. */
+          queue_cur = tiny_select_seed();
+
+          /* If no seed is available, safely end this cycle. */
+          if (!queue_cur)
+            queue_cur = NULL;
+
+        }
+
+    #else
+
+        queue_cur = queue_cur->next;
+        current_entry++;
+
+    #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
 
   }
 

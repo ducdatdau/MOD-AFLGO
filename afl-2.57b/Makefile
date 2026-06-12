@@ -33,11 +33,13 @@ CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
 	      -DBIN_PATH=\"$(BIN_PATH)\" \
 	      -DAFLGO_IMPL=1
 # Turn on FastAFLGo mode: 
-# CFLAGS     += -DMOD_AFLGO_FAST=1
+CFLAGS     += -DMOD_AFLGO_FAST=1
 # Turn on Generalized ExponentialAFLGo mode: 
-# CFLAGS     += -DMOD_AFLGO_GEXP=1
+CFLAGS     += -DMOD_AFLGO_GEXP=1
 # Turn on logging of MOD-AFLGo metrics:
-# CFLAGS     += -DMOD_AFLGO_LOG=1	
+CFLAGS     += -DMOD_AFLGO_LOG=1
+# Turn on TinyFuzz mode:
+CFLAGS     += -DMOD_AFLGO_TINY_QUEUE=1
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
   LDFLAGS  += -ldl -lm
