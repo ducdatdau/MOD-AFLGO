@@ -405,6 +405,54 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_top, /* Top of the list                  */
                           *q_prev100; /* Previous 100 marker              */
 
+ 
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
+
+/* TinyFuzz auxiliary queues.
+ These queues store pointers to existing queue_entry objects.
+ They do NOT own seed memory and must NOT free queue entries. */
+
+static struct queue_entry *tiny_q1_head = NULL, *tiny_q1_tail = NULL;
+static struct queue_entry *tiny_q2_head = NULL, *tiny_q2_tail = NULL;
+static struct queue_entry *tiny_q3_head = NULL, *tiny_q3_tail = NULL;
+
+static u32 tiny_q1_cnt = 0;
+static u32 tiny_q2_cnt = 0;
+static u32 tiny_q3_cnt = 0;
+
+/* Counts how many times TinyFuzz has selected a seed.
+ Used to enforce the Q1:Q2:Q3 = 7:2:1 ratio. */
+static u64 tiny_select_cnt = 0;
+
+static u32 tiny_cycle_budget = 0;
+static u32 tiny_cycle_done   = 0;
+
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
+
+static struct queue_entry*
+  top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
+
+struct extra_data {
+  u8* data;                           /* Dictionary token data            */
+  u32 len;                            /* Dictionary token length          */
+  u32 hit_cnt;                        /* Use count in the corpus          */
+};
+
+static struct extra_data* extras;     /* Extra tokens to fuzz with        */
+static u32 extras_cnt;                /* Total number of tokens read      */
+
+static struct extra_data* a_extras;   /* Automatically selected extras    */
+static u32 a_extras_cnt;              /* Total number of tokens available */
+
+#if AFLGO_IMPL
+
+static double cur_distance = -1.0;     /* Distance of executed input             */
+static double max_distance = -1.0;     /* Maximal distance for any input         */
+static double min_distance = -1.0;     /* Minimal distance for any input         */
+static u32 t_x = 10;                   /* Time to exploitation (Default: 10 min) */
+
+#endif // AFLGO_IMPL
+
 /* ========================================================================= *
  * TINYFUZZ QUEUE 2: 3-TIER PRIORITY QUEUE VỚI NGƯỠNG ĐỘNG                 *
  * ========================================================================= */
@@ -453,53 +501,6 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
  }
  
 #endif /* TINYFUZZ_QUEUE_2 */
- 
-#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
-
-/* TinyFuzz auxiliary queues.
- These queues store pointers to existing queue_entry objects.
- They do NOT own seed memory and must NOT free queue entries. */
-
-static struct queue_entry *tiny_q1_head = NULL, *tiny_q1_tail = NULL;
-static struct queue_entry *tiny_q2_head = NULL, *tiny_q2_tail = NULL;
-static struct queue_entry *tiny_q3_head = NULL, *tiny_q3_tail = NULL;
-
-static u32 tiny_q1_cnt = 0;
-static u32 tiny_q2_cnt = 0;
-static u32 tiny_q3_cnt = 0;
-
-/* Counts how many times TinyFuzz has selected a seed.
- Used to enforce the Q1:Q2:Q3 = 7:2:1 ratio. */
-static u64 tiny_select_cnt = 0;
-
-static u32 tiny_cycle_budget = 0;
-static u32 tiny_cycle_done   = 0;
-
-#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
-
-static struct queue_entry*
-  top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
-
-struct extra_data {
-  u8* data;                           /* Dictionary token data            */
-  u32 len;                            /* Dictionary token length          */
-  u32 hit_cnt;                        /* Use count in the corpus          */
-};
-
-static struct extra_data* extras;     /* Extra tokens to fuzz with        */
-static u32 extras_cnt;                /* Total number of tokens read      */
-
-static struct extra_data* a_extras;   /* Automatically selected extras    */
-static u32 a_extras_cnt;              /* Total number of tokens available */
-
-#if AFLGO_IMPL
-
-static double cur_distance = -1.0;     /* Distance of executed input             */
-static double max_distance = -1.0;     /* Maximal distance for any input         */
-static double min_distance = -1.0;     /* Minimal distance for any input         */
-static u32 t_x = 10;                   /* Time to exploitation (Default: 10 min) */
-
-#endif // AFLGO_IMPL
 
 static u8* (*post_handler)(u8* buf, u32* len);
 
@@ -9096,8 +9097,8 @@ OKF("TINYFUZZ_QUEUE_2: ON");
 #if defined(TINYFUZZ_QUEUE_2)
       queue_cur = pop_pq();
       /* Khởi đầu an toàn: nếu PQ trống, lấy từ queue gốc */
-if (!queue_cur) queue_cur = queue;
-#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
+      if (!queue_cur) queue_cur = queue;
+#elif AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
       /* Start a new AFL-style queue cycle.
      Snapshot the current corpus size. Even if new seeds are added
      during this cycle, they will be counted in the next cycle. */
