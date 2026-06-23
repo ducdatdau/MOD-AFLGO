@@ -476,16 +476,97 @@ static u32 t_x = 10;                   /* Time to exploitation (Default: 10 min)
  }
  
  /* Rút Seed ưu tiên nhất ra (O(1)) */
- static struct queue_entry* pop_pq(void) {
-   for (u8 i = 0; i < 3; ++i) {
-     if (pri_queue[i] == NULL) continue;
-     struct queue_entry* ret = pri_queue[i];
-     pri_queue[i] = ret->next_pq;
-     if (pri_queue[i] == NULL) pri_queue_last[i] = NULL;
-     return ret;
-   }
-   return NULL;
- }
+//  static struct queue_entry* pop_pq(void) {
+//    for (u8 i = 0; i < 3; ++i) {
+//      if (pri_queue[i] == NULL) continue;
+//      struct queue_entry* ret = pri_queue[i];
+//      pri_queue[i] = ret->next_pq;
+//      if (pri_queue[i] == NULL) pri_queue_last[i] = NULL;
+//      return ret;
+//    }
+//    return NULL;
+//  }
+
+// New pop pq
+/* Các biến toàn cục dùng để theo dõi sự đình trệ (Aging) và Đói (Starvation) */
+static u32 t0_useless_count      = 0; /* Số lần bốc Tier 0 liên tiếp mà không có path mới */
+static u32 t1_starvation_count   = 0; /* Số chu kỳ Tier 1 bị bỏ đói */
+static u32 t2_starvation_count   = 0; /* Số chu kỳ Tier 2 bị bỏ đói */
+static u32 previous_queued_paths = 0; /* Lưu lại số lượng path ở lần kiểm tra trước */
+
+/* Hàm lấy Seed thông minh (Có chống kẹt Local Optimum) - Độ phức tạp O(1) */
+static struct queue_entry* pop_pq(void) {
+  
+  u8 selected_tier = 0;
+  u8 force_tier    = 255; /* 255 nghĩa là không ép buộc, chạy theo tự nhiên */
+
+  /* ------------------------------------------------------------------ *
+   * BƯỚC 1: KIỂM TRA SỰ TIẾN BỘ CỦA TIER 0 (Fatigue Penalty)
+   * Biến 'queued_paths' là biến toàn cục của AFL lưu tổng số đường dẫn.
+   * ------------------------------------------------------------------ */
+  if (queued_paths > previous_queued_paths) {
+      /* Fuzzer vừa tìm được đường mới -> Tier 0 đang làm việc rất hiệu quả! */
+      t0_useless_count = 0; 
+      previous_queued_paths = queued_paths;
+  }
+
+  /* Nếu bốc Tier 0 tới 50 lần mà không có đường nào mới -> Bị kẹt ngõ cụt */
+  if (t0_useless_count > 50) {
+      force_tier = 1; /* Ép giáng cấp, bốc từ Tier 1 */
+      
+      /* Nếu kẹt quá nặng (100 lần), cầu cứu đến các seed cũ ở Tier 2 */
+      if (t0_useless_count > 100) force_tier = 2; 
+  }
+
+  /* ------------------------------------------------------------------ *
+   * BƯỚC 2: CƠ CHẾ CHỐNG ĐÓI (Anti-Starvation)
+   * Đảm bảo Tier 1 và Tier 2 không bao giờ bị lãng quên vĩnh viễn.
+   * ------------------------------------------------------------------ */
+  if (t1_starvation_count > 150) force_tier = 1;
+  if (t2_starvation_count > 500) force_tier = 2;
+
+  /* ------------------------------------------------------------------ *
+   * BƯỚC 3: QUYẾT ĐỊNH BỐC TỪ TIER NÀO
+   * ------------------------------------------------------------------ */
+  /* Nếu có lệnh ép buộc VÀ tier bị ép buộc không rỗng */
+  if (force_tier != 255 && pri_queue[force_tier] != NULL) {
+      selected_tier = force_tier;
+  } else {
+      /* Chạy theo logic gốc: Ưu tiên tuyệt đối 0 -> 1 -> 2 */
+      if      (pri_queue[0] != NULL) selected_tier = 0;
+      else if (pri_queue[1] != NULL) selected_tier = 1;
+      else if (pri_queue[2] != NULL) selected_tier = 2;
+      else return NULL; /* Toàn bộ Queue 3 tầng đều rỗng */
+  }
+
+  /* ------------------------------------------------------------------ *
+   * BƯỚC 4: RÚT SEED VÀ CẬP NHẬT TRẠNG THÁI
+   * ------------------------------------------------------------------ */
+  struct queue_entry* ret = pri_queue[selected_tier];
+  pri_queue[selected_tier] = ret->next_pq;
+  if (pri_queue[selected_tier] == NULL) {
+      pri_queue_last[selected_tier] = NULL;
+  }
+
+  /* Cập nhật các bộ đếm Aging dựa trên Tier vừa bị bốc */
+  if (selected_tier == 0) {
+      t0_useless_count++;      /* Lại bốc Tier 0, tăng nguy cơ useless */
+      t1_starvation_count++;   /* Tier 1 và 2 tiếp tục bị đói */
+      t2_starvation_count++;
+  } 
+  else if (selected_tier == 1) {
+      t1_starvation_count = 0; /* Đã cho Tier 1 ăn */
+      t0_useless_count = 0;    /* Reset để Tier 0 có cơ hội quay lại sau */
+      t2_starvation_count++;
+  } 
+  else if (selected_tier == 2) {
+      t2_starvation_count = 0; /* Đã cho Tier 2 ăn */
+      t0_useless_count = 0;
+      t1_starvation_count++;
+  }
+
+  return ret;
+}
  
  /* Tính ngưỡng eta động từ Nhiệt độ T */
  static inline double calculate_dynamic_eta(double temp) {

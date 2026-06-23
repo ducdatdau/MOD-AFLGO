@@ -19,5 +19,4 @@ $AFLGO/distance/gen_distance_orig.sh $PWD/util $TMP_DIR gifsponge
 CFLAGS="-distance=$TMP_DIR/distance.cfg.txt" CXXFLAGS="-distance=$TMP_DIR/distance.cfg.txt" ../configure --disable-shared --prefix=`pwd`
 make clean; make -j4
 mkdir in; echo "GIF" > in/in
-$AFLGO/afl-2.57b/afl-fuzz -m none -z exp -c 45m -i in -o out util/gifsponge
-# mkdir out; for i in {1..10}; do timeout -sHUP 60m $AFLGO/afl-2.57b/afl-fuzz -m none -z exp -c 45m -i in -o "out/out_$i" util/gifsponge > /dev/null 2>&1 & done
+timeout 24h $AFLGO/afl-2.57b/afl-fuzz -m none -z gexp -c 45m -i in -o out util/gifsponge || true
