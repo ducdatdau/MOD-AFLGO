@@ -28,6 +28,14 @@
 
 */
 
+/*
+* AFLGO_IMPL: AFLGO implementation
+* FAST_AFLGO: FastAFLGo implementation
+* TINYFUZZ_GEXP: TinyFuzz with Generalized Exponential schedule
+* TINYFUZZ_QUEUE_1: TinyFuzz with priority queue 1 
+* TINYFUZZ_QUEUE_2: TinyFuzz with priority queue 2
+*/
+
 #define AFL_MAIN
 #include "android-ashmem.h"
 #define MESSAGES_TO_STDOUT
@@ -44,6 +52,7 @@
 #include "hash.h"
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +65,7 @@
 #include <termios.h>
 #include <dlfcn.h>
 #include <sched.h>
+#include <math.h>
 
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -80,7 +90,7 @@ static u64 last_metric_execs = 0;
    TinyFuzz: Dynamic Rank-based Three-Queue Priority Scheduling
    ----------------------------------------------------------------
    Enable with:
-       -DMOD_AFLGO_TINY_QUEUE
+       -DTINYFUZZ_QUEUE_1
 
    This feature does NOT replace AFL/AFLGo's original queue.
    It adds three auxiliary queues as a scheduling layer:
@@ -93,8 +103,7 @@ static u64 last_metric_execs = 0;
    Q1/Q2/Q3 only store pointers to queue_entry objects.
    ================================================================ */
 
-   #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
-
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
    /* Three auxiliary queue levels. */
    #define TINY_Q_NONE  0
    #define TINY_Q_HIGH  1
@@ -140,7 +149,7 @@ static u64 last_metric_execs = 0;
    /* Small epsilon to avoid division by zero. */
    #define TINY_EPS 1e-9
    
-   #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -193,13 +202,13 @@ enum {
   /* 01 */ SAN_LOG,                   /* Logarithmical schedule                */
   /* 02 */ SAN_LIN,                   /* Linear schedule                       */
   /* 03 */ SAN_QUAD                   /* Quadratic schedule                    */
-#ifdef MOD_AFLGO_FAST
+#ifdef FAST_AFLGO
           ,SAN_FAST                   /* Fast schedule                         */
-#endif // MOD_AFLGO_FAST
+#endif // FAST_AFLGO
 
-#ifdef MOD_AFLGO_GEXP
+#ifdef TINYFUZZ_GEXP
           ,SAN_GEXP                   /* Generalized exponential schedule      */
-#endif // MOD_AFLGO_GEXP
+#endif // TINYFUZZ_GEXP
 };
 
 #endif // AFLGO_IMPL
@@ -358,7 +367,7 @@ struct queue_entry {
   double distance;                    /* Distance to targets              */
 #endif // AFLGO_IMPL
 
-#if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
   /* TinyFuzz metadata.
      These fields are used only for the auxiliary priority queues.
@@ -380,8 +389,11 @@ struct queue_entry {
   struct queue_entry *tiny_prev,      /* Previous seed in auxiliary queue  */
                      *tiny_next;      /* Next seed in auxiliary queue      */
 
-#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
+#if defined(TINYFUZZ_QUEUE_2)
+  struct queue_entry *next_pq;        /* Con trỏ vòng lặp của PQ 3 tầng */
+#endif
 
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
@@ -393,32 +405,80 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_top, /* Top of the list                  */
                           *q_prev100; /* Previous 100 marker              */
 
-                          #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+/* ========================================================================= *
+ * TINYFUZZ QUEUE 2: 3-TIER PRIORITY QUEUE VỚI NGƯỠNG ĐỘNG                 *
+ * ========================================================================= */
+ #if defined(TINYFUZZ_QUEUE_2)
 
-                          /* TinyFuzz auxiliary queues.
-                             These queues store pointers to existing queue_entry objects.
-                             They do NOT own seed memory and must NOT free queue entries. */
-                          
-                          static struct queue_entry *tiny_q1_head = NULL, *tiny_q1_tail = NULL;
-                          static struct queue_entry *tiny_q2_head = NULL, *tiny_q2_tail = NULL;
-                          static struct queue_entry *tiny_q3_head = NULL, *tiny_q3_tail = NULL;
-                          
-                          static u32 tiny_q1_cnt = 0;
-                          static u32 tiny_q2_cnt = 0;
-                          static u32 tiny_q3_cnt = 0;
-                          
-                          /* Counts how many times TinyFuzz has selected a seed.
-                             Used to enforce the Q1:Q2:Q3 = 7:2:1 ratio. */
-                          static u64 tiny_select_cnt = 0;
+ double global_temperature = 1.0; /* Nhiệt độ T gốc từ AFLGo */
+ 
+ static struct queue_entry* pri_queue[3]      = {NULL, NULL, NULL};
+ static struct queue_entry* pri_queue_last[3] = {NULL, NULL, NULL};
+ 
+ /* Thêm vào Queue theo Tier (O(1)) */
+ static void push_pq(u8 level, struct queue_entry* q) {
+   q->next_pq = NULL;
+   if (pri_queue_last[level] == NULL) {
+     pri_queue[level] = q;
+     pri_queue_last[level] = q;
+   } else {
+     pri_queue_last[level]->next_pq = q;
+     pri_queue_last[level] = q;
+   }
+ }
+ 
+ /* Rút Seed ưu tiên nhất ra (O(1)) */
+ static struct queue_entry* pop_pq(void) {
+   for (u8 i = 0; i < 3; ++i) {
+     if (pri_queue[i] == NULL) continue;
+     struct queue_entry* ret = pri_queue[i];
+     pri_queue[i] = ret->next_pq;
+     if (pri_queue[i] == NULL) pri_queue_last[i] = NULL;
+     return ret;
+   }
+   return NULL;
+ }
+ 
+ /* Tính ngưỡng eta động từ Nhiệt độ T */
+ static inline double calculate_dynamic_eta(double temp) {
+   double max_eta = 0.8; /* Khi T = 1.0 (Khám phá) -> Rất khắt khe */
+   double min_eta = 0.5; /* Khi T = 0.0 (Khai thác) -> Nới lỏng */
+   return min_eta + (max_eta - min_eta) * temp; 
+ }
+ 
+ /* Tính điểm năng lượng bằng khoảng cách AFLGo chuẩn hóa */
+ static inline double power_factor(struct queue_entry* q) {
+   if (max_distance <= 0 || min_distance < 0 || max_distance == min_distance) return 0.5;
+   return 1.0 - ((q->distance - min_distance) / (max_distance - min_distance));
+ }
+ 
+#endif /* TINYFUZZ_QUEUE_2 */
+ 
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
-                          static u32 tiny_cycle_budget = 0;
-                          static u32 tiny_cycle_done   = 0;
-                                                    
-                          #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+/* TinyFuzz auxiliary queues.
+ These queues store pointers to existing queue_entry objects.
+ They do NOT own seed memory and must NOT free queue entries. */
+
+static struct queue_entry *tiny_q1_head = NULL, *tiny_q1_tail = NULL;
+static struct queue_entry *tiny_q2_head = NULL, *tiny_q2_tail = NULL;
+static struct queue_entry *tiny_q3_head = NULL, *tiny_q3_tail = NULL;
+
+static u32 tiny_q1_cnt = 0;
+static u32 tiny_q2_cnt = 0;
+static u32 tiny_q3_cnt = 0;
+
+/* Counts how many times TinyFuzz has selected a seed.
+ Used to enforce the Q1:Q2:Q3 = 7:2:1 ratio. */
+static u64 tiny_select_cnt = 0;
+
+static u32 tiny_cycle_budget = 0;
+static u32 tiny_cycle_done   = 0;
+
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
-
 
 struct extra_data {
   u8* data;                           /* Dictionary token data            */
@@ -939,7 +999,7 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 }
 
-#if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
 /* Return the head pointer of the selected TinyFuzz queue level. */
 static struct queue_entry** tiny_head_of(u8 level) {
@@ -1213,7 +1273,7 @@ static void tiny_rebuild_queues(void) {
 
 }
 
-#if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
 static void tiny_mark_selected(struct queue_entry* q) {
 
@@ -1228,7 +1288,7 @@ static void tiny_mark_selected(struct queue_entry* q) {
 
 }
 
-#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
 /* Pick the best seed from one auxiliary queue.
    "Best" means the highest current TinyFuzz priority score. */
@@ -1306,7 +1366,7 @@ static struct queue_entry* tiny_select_seed(void) {
 
 }
 
-#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
 /* Append new test case to the queue. */
 
@@ -1318,8 +1378,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
-  #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
 
+#if TINYFUZZ_QUEUE_1
   /* Stable ID of this seed in AFLGo's original queue.
      queued_paths is not incremented yet here, so it is the new seed ID. */
   q->tiny_id = queued_paths;
@@ -1339,8 +1399,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->tiny_in_aux_queue = 0;
   q->tiny_prev = NULL;
   q->tiny_next = NULL;
-
-#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* TINYFUZZ_QUEUE_1 */
 
 #if AFLGO_IMPL
 
@@ -1370,14 +1429,26 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   queued_paths++;
   pending_not_fuzzed++;
-  #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
   /* Insert the new seed into one of Q1/Q2/Q3.
      For initial seeds, the distance may still be unknown at this moment.
      It will be reclassified again after calibration. */
   tiny_reclassify_seed(q);
 
-  #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
+#if defined(TINYFUZZ_QUEUE_2)
+  
+  double dynamic_eta = calculate_dynamic_eta(global_temperature);
+  double current_power = power_factor(q);
+
+  if (q->has_new_cov || current_power > dynamic_eta) {
+      push_pq(0, q); // Tier 0 (Ưu tiên đột phá)
+  } else {
+      push_pq(1, q); // Tier 1 (Hạt giống bình thường)
+  }
+  
+#endif /* TINYFUZZ_QUEUE_2 */
 
   cycles_wo_finds = 0;
 
@@ -3248,13 +3319,13 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
       }
 
     }
-    #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+    #if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
     /* After calibration, initial seeds may finally get valid AFLGo distance.
       Reclassify them so Q1/Q2/Q3 reflect the updated distance. */
     tiny_reclassify_seed(q);
 
-  #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+  #endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
 #endif // AFLGO_IMPL
 
@@ -3827,13 +3898,13 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     }
 
     queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-    #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
   /* The seed has just been marked with has_new_cov if it discovered new edges.
      Reclassify it so coverage novelty N(s) is reflected in its priority. */
   tiny_reclassify_seed(queue_top);
 
-#endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
@@ -5388,7 +5459,7 @@ static u32 choose_block_len(u32 limit) {
 
 }
 
-#if AFLGO_IMPL && defined(MOD_AFLGO_FAST)
+#if AFLGO_IMPL && defined(FAST_AFLGO)
 
 static double fast_aflgo_temperature(double x) {
 
@@ -5411,9 +5482,9 @@ static double fast_aflgo_temperature(double x) {
   return T;
 }
 
-#endif // AFLGO_IMPL && defined(MOD_AFLGO_FAST)
+#endif // AFLGO_IMPL && defined(FAST_AFLGO)
 
-#if AFLGO_IMPL && defined(MOD_AFLGO_GEXP)
+#if AFLGO_IMPL && defined(TINYFUZZ_GEXP)
 // T(x) = 20 ^ -((x / λ)^γ)
 
 // x  = elapsed_time / time_to_exploitation
@@ -5439,7 +5510,7 @@ static double mod_gexp_temperature(double x) {
 
   return T;
 }
-#endif // AFLGO_IMPL && defined(MOD_AFLGO_GEXP)
+#endif // AFLGO_IMPL && defined(TINYFUZZ_GEXP)
 
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
@@ -5538,13 +5609,13 @@ static u32 calculate_score(struct queue_entry* q) {
 
       break;
 
-#ifdef MOD_AFLGO_FAST
+#ifdef FAST_AFLGO
     case SAN_FAST:
       T = fast_aflgo_temperature(progress_to_tx);
       break;
-#endif // MOD_AFLGO_FAST
+#endif // FAST_AFLGO
 
-#ifdef MOD_AFLGO_GEXP
+#ifdef TINYFUZZ_GEXP
     case SAN_GEXP:
       T = mod_gexp_temperature(progress_to_tx);
       break;
@@ -5554,6 +5625,12 @@ static u32 calculate_score(struct queue_entry* q) {
       PFATAL ("Unkown Power Schedule for Directed Fuzzing");
   }
 
+#if defined(TINYFUZZ_QUEUE_2)
+  /* Bắt lấy Nhiệt độ T để điều khiển ngưỡng của Queue */
+  if (T > 1.0) T = 1.0;
+  if (T < 0.0) T = 0.0;
+  global_temperature = T;
+#endif
   double power_factor = 1.0;
   double p = 0.0;
   if (q->distance > 0) {
@@ -5611,9 +5688,7 @@ static u32 calculate_score(struct queue_entry* q) {
     t, q->distance, max_distance, min_distance, T, power_factor, perf_score);
   */
 #endif // AFLGO_IMPL
-
-  return perf_score;
-
+    return perf_score;
 }
 
 
@@ -8621,11 +8696,17 @@ OKF("AFLGO_IMPL: ON");
 #if MOD_AFLGO_LOG
 OKF("MOD_AFLGO_LOG: ON");
 #endif
-#if MOD_AFLGO_FAST
-OKF("MOD_AFLGO_FAST: ON");
+#if FAST_AFLGO
+OKF("FAST_AFLGO: ON");
 #endif
-#if MOD_AFLGO_GEXP
-OKF("MOD_AFLGO_GEXP: ON");
+#if TINYFUZZ_GEXP
+OKF("TINYFUZZ_GEXP: ON");
+#endif
+#if TINYFUZZ_QUEUE_1
+OKF("TINYFUZZ_QUEUE_1: ON");
+#endif
+#if TINYFUZZ_QUEUE_2
+OKF("TINYFUZZ_QUEUE_2: ON");
 #endif
 
 #if AFLGO_IMPL
@@ -8823,13 +8904,13 @@ OKF("MOD_AFLGO_GEXP: ON");
           cooling_schedule = SAN_LIN;
         else if (!stricmp(optarg, "quad"))
           cooling_schedule = SAN_QUAD;
-#ifdef MOD_AFLGO_FAST
+#ifdef FAST_AFLGO
         else if (!stricmp(optarg, "fast")) cooling_schedule = SAN_FAST;
-#endif // MOD_AFLGO_FAST
+#endif // FAST_AFLGO
 
-#ifdef MOD_AFLGO_GEXP
+#ifdef TINYFUZZ_GEXP
         else if (!stricmp(optarg, "gexp")) cooling_schedule = SAN_GEXP;
-#endif // MOD_AFLGO_GEXP  
+#endif // TINYFUZZ_GEXP  
         else
           PFATAL ("Unknown value for option -z");
 
@@ -8902,7 +8983,6 @@ OKF("MOD_AFLGO_GEXP: ON");
   if (getenv("AFL_NO_ARITH"))      no_arith         = 1;
   if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
   if (getenv("AFL_FAST_CAL"))      fast_cal         = 1;
-
   if (getenv("AFL_HANG_TMOUT")) {
     hang_tmout = atoi(getenv("AFL_HANG_TMOUT"));
     if (!hang_tmout) FATAL("Invalid value of AFL_HANG_TMOUT");
@@ -8967,7 +9047,6 @@ OKF("MOD_AFLGO_GEXP: ON");
   if (!out_file) setup_stdio_file();
 
   check_binary(argv[optind]);
-
   start_time = get_cur_time();
 
   if (qemu_mode)
@@ -9014,7 +9093,11 @@ OKF("MOD_AFLGO_GEXP: ON");
       //   seek_to--;
       //   queue_cur = queue_cur->next;
       // }
-      #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+#if defined(TINYFUZZ_QUEUE_2)
+      queue_cur = pop_pq();
+      /* Khởi đầu an toàn: nếu PQ trống, lấy từ queue gốc */
+if (!queue_cur) queue_cur = queue;
+#if AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
       /* Start a new AFL-style queue cycle.
      Snapshot the current corpus size. Even if new seeds are added
      during this cycle, they will be counted in the next cycle. */
@@ -9048,7 +9131,7 @@ OKF("MOD_AFLGO_GEXP: ON");
     
       }
     
-    #else
+#else
     
       queue_cur = queue;
     
@@ -9058,7 +9141,7 @@ OKF("MOD_AFLGO_GEXP: ON");
         queue_cur = queue_cur->next;
       }
 
-      #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+#endif /* AFLGO_IMPL && TINYFUZZ_QUEUE_1 */
 
       show_stats();
 
@@ -9098,36 +9181,57 @@ OKF("MOD_AFLGO_GEXP: ON");
 
     // queue_cur = queue_cur->next;
     // current_entry++;
-    #if AFLGO_IMPL && defined(MOD_AFLGO_TINY_QUEUE)
+#if defined(TINYFUZZ_QUEUE_2)
 
-        /* One TinyFuzz scheduling step has finished. */
-        tiny_cycle_done++;
-        current_entry = tiny_cycle_done;
+    /* --- MÃ NGUỒN CỦA TINYFUZZ 3-TIER QUEUE --- */
+    /* 1. Đẩy seed vừa fuzz xong xuống Tầng 2 (Tier 2 - Mức ưu tiên thấp nhất để tái sử dụng) */
+    if (queue_cur) {
+        push_pq(2, queue_cur); 
+    }
 
-        /* End this AFL-style queue cycle after selecting tiny_cycle_budget seeds.
-          This restores the original AFL behavior where a cycle ends after
-          traversing the whole corpus once. */
-        if (tiny_cycle_done >= tiny_cycle_budget) {
+    /* 2. Bốc seed ưu tiên nhất từ Priority Queue ra để chuẩn bị cho vòng lặp tiếp theo */
+    queue_cur = pop_pq();
 
-          queue_cur = NULL;
+    /* 3. Fallback an toàn: Chống crash nếu Priority Queue bất ngờ rỗng */
+    if (!queue_cur) {
+        queue_cur = queue;
+    }
+    
+    current_entry++;
+    /* ------------------------------------------ */
 
-        } else {
+#elif AFLGO_IMPL && defined(TINYFUZZ_QUEUE_1)
 
-          /* Select next seed from Q1/Q2/Q3 instead of queue_cur->next. */
-          queue_cur = tiny_select_seed();
+    /* One TinyFuzz scheduling step has finished. */
+    tiny_cycle_done++;
+    current_entry = tiny_cycle_done;
 
-          /* If no seed is available, safely end this cycle. */
-          if (!queue_cur)
-            queue_cur = NULL;
+    /* End this AFL-style queue cycle after selecting tiny_cycle_budget seeds.
+      This restores the original AFL behavior where a cycle ends after
+      traversing the whole corpus once. */
+    if (tiny_cycle_done >= tiny_cycle_budget) {
 
-        }
+      queue_cur = NULL;
 
-    #else
+    } else {
 
-        queue_cur = queue_cur->next;
-        current_entry++;
+      /* Select next seed from Q1/Q2/Q3 instead of queue_cur->next. */
+      queue_cur = tiny_select_seed();
 
-    #endif /* AFLGO_IMPL && MOD_AFLGO_TINY_QUEUE */
+      /* If no seed is available, safely end this cycle. */
+      if (!queue_cur)
+        queue_cur = NULL;
+
+    }
+
+#else
+
+    /* Luồng xử lý nguyên thủy của AFL/AFLGo */
+    queue_cur = queue_cur->next;
+    current_entry++;
+
+#endif /* TINYFUZZ_QUEUE_2 / TINYFUZZ_QUEUE_1 / GỐC */
+
 
   }
 
